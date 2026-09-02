@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from .channels import ChannelError, ChannelRegistry
 from .database import create_database, init_database
+from .delivery_probe import TestDeliveryValidationError, enqueue_test_delivery
 from .schemas import (
     DashboardSummary,
     NotificationAccepted,
@@ -20,6 +21,15 @@ from .schemas import (
     TaskDetail,
     TaskList,
     TaskView,
+    TestDeliveryRequest,
+    WorkerSettingsUpdate,
+    WorkerSettingsView,
+)
+from .runtime_settings import (
+    get_max_delivery_retries,
+    get_worker_processes,
+    set_max_delivery_retries,
+    set_worker_processes,
 )
 from .service import (
     TaskConflictError,
@@ -59,7 +69,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(app_settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT"],
         allow_headers=["Content-Type", "Idempotency-Key"],
     )
 
@@ -76,6 +86,69 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def channels() -> dict[str, list[str]]:
         return {"items": registry.names()}
 
+    def worker_settings_view(
+        process_count: int, max_delivery_retries: int
+    ) -> WorkerSettingsView:
+        return WorkerSettingsView(
+            worker_processes=process_count,
+            max_worker_processes=app_settings.max_worker_processes,
+            per_process_concurrency=app_settings.worker_concurrency,
+            theoretical_max_concurrency=process_count * app_settings.worker_concurrency,
+            max_delivery_retries=max_delivery_retries,
+        )
+
+    @app.get("/api/v1/settings/workers", response_model=WorkerSettingsView)
+    def get_worker_settings() -> WorkerSettingsView:
+        process_count = get_worker_processes(
+            session_factory, app_settings.worker_processes, app_settings.max_worker_processes
+        )
+        max_retries = get_max_delivery_retries(
+            session_factory, app_settings.default_max_retries
+        )
+        return worker_settings_view(process_count, max_retries)
+
+    @app.put("/api/v1/settings/workers", response_model=WorkerSettingsView)
+    def update_worker_settings(
+        payload: WorkerSettingsUpdate, session: Session = Depends(get_session)
+    ) -> WorkerSettingsView:
+        current_processes = get_worker_processes(
+            session_factory, app_settings.worker_processes, app_settings.max_worker_processes
+        )
+        current_retries = get_max_delivery_retries(
+            session_factory, app_settings.default_max_retries
+        )
+        process_count = (
+            set_worker_processes(
+                session, payload.worker_processes, app_settings.max_worker_processes
+            )
+            if payload.worker_processes is not None
+            else current_processes
+        )
+        max_retries = (
+            set_max_delivery_retries(session, payload.max_delivery_retries)
+            if payload.max_delivery_retries is not None
+            else current_retries
+        )
+        return worker_settings_view(process_count, max_retries)
+
+    @app.post(
+        "/api/v1/test-deliveries",
+        response_model=NotificationAccepted,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def test_delivery(payload: TestDeliveryRequest) -> NotificationAccepted:
+        try:
+            return enqueue_test_delivery(
+                session_factory,
+                payload,
+                app_settings.test_allowed_hosts,
+                get_max_delivery_retries(
+                    session_factory, app_settings.default_max_retries
+                ),
+            )
+        except TestDeliveryValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post(
         "/api/v1/notifications",
         response_model=NotificationAccepted,
@@ -86,7 +159,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if header_key:
             payload.idempotency_key = header_key
         try:
-            task, duplicated = create_notification(session_factory, registry, payload)
+            task, duplicated = create_notification(
+                session_factory,
+                registry,
+                payload,
+                get_max_delivery_retries(
+                    session_factory, app_settings.default_max_retries
+                ),
+            )
         except ChannelError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return NotificationAccepted(id=task.id, status=task.status, duplicated=duplicated)
@@ -125,7 +205,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.post("/api/v1/tasks/{task_id}/retry", response_model=TaskView)
     def manual_retry(task_id: str, session: Session = Depends(get_session)) -> TaskView:
         try:
-            return retry_task(session, task_id, registry)
+            return retry_task(
+                session,
+                task_id,
+                registry,
+                get_max_delivery_retries(
+                    session_factory, app_settings.default_max_retries
+                ),
+            )
         except TaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail="任务不存在") from exc
         except TaskConflictError as exc:

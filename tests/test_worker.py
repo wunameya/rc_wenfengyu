@@ -4,7 +4,9 @@ import asyncio
 
 import httpx
 
-from app.worker import NotificationWorker
+import pytest
+
+from app.worker import NotificationWorker, run_worker_processes
 
 
 def test_worker_retries_then_succeeds(app_context, sample_payload, monkeypatch):
@@ -90,4 +92,11 @@ def test_dashboard_summary(app_context, sample_payload, monkeypatch):
     assert summary["dead"] == 1
     assert summary["failed_attempts_24h"] == 1
     assert summary["success_rate_24h"] == 0.0
+
+
+def test_multiple_worker_processes_require_mysql(app_context):
+    _, _, settings = app_context
+
+    with pytest.raises(ValueError, match="多 Worker 不支持 SQLite"):
+        run_worker_processes(settings, process_count=2, run_once=True)
 

@@ -3,7 +3,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -27,12 +38,16 @@ class NotificationTask(Base):
     channel: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     variables: Mapped[dict] = mapped_column(JSON, nullable=False)
     request_method: Mapped[str] = mapped_column(String(10), nullable=False)
     target_url: Mapped[str] = mapped_column(Text, nullable=False)
     request_headers: Mapped[dict] = mapped_column(JSON, nullable=False)
     request_body: Mapped[Any] = mapped_column(JSON, nullable=True)
+    request_timeout_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=5)
+    base_retry_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=10)
+    max_retry_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=86400)
 
     total_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     current_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -72,4 +87,14 @@ class DeliveryAttempt(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
 
     task: Mapped[NotificationTask] = relationship(back_populates="attempts")
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
 

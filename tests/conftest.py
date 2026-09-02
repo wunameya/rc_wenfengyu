@@ -33,7 +33,7 @@ def app_context(tmp_path: Path):
                         },
                         "body": {"event_id": "{{ event_id }}", "data": "{{ data }}"},
                         "timeout_seconds": 1,
-                        "max_attempts": 3,
+                        "max_retries": 2,
                         "max_concurrency": 2,
                         "base_retry_seconds": 0,
                         "max_retry_seconds": 1,

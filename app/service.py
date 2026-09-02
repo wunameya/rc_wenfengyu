@@ -42,6 +42,7 @@ def create_notification(
     session_factory: sessionmaker[Session],
     registry: ChannelRegistry,
     payload: NotificationCreate,
+    max_retries: int = 10,
 ) -> tuple[NotificationTask, bool]:
     channel = registry.get(payload.channel)
     target_url, request_headers, request_body = render_channel(channel, payload.variables)
@@ -51,12 +52,16 @@ def create_notification(
         channel=payload.channel,
         idempotency_key=payload.idempotency_key,
         status="PENDING",
+        is_test=False,
         variables=payload.variables,
         request_method=channel.method,
         target_url=target_url,
         request_headers=request_headers,
         request_body=request_body,
-        max_attempts=channel.max_attempts,
+        request_timeout_seconds=channel.timeout_seconds,
+        base_retry_seconds=channel.base_retry_seconds,
+        max_retry_seconds=channel.max_retry_seconds,
+        max_attempts=min(channel.max_attempts, max_retries + 1),
         next_retry_at=now,
         created_at=now,
         updated_at=now,
@@ -132,22 +137,37 @@ def get_task_detail(session: Session, task_id: str) -> TaskDetail:
 
 
 def retry_task(
-    session: Session, task_id: str, registry: ChannelRegistry
+    session: Session,
+    task_id: str,
+    registry: ChannelRegistry,
+    max_retries: int = 10,
 ) -> TaskView:
     task = session.get(NotificationTask, task_id)
     if task is None:
         raise TaskNotFoundError(task_id)
     if task.status not in FAILED_STATUSES:
         raise TaskConflictError(f"状态为 {task.status} 的任务不能人工重试")
-    channel = registry.get(task.channel)
-    target_url, request_headers, request_body = render_channel(channel, task.variables)
+    if task.is_test:
+        request_method = task.request_method
+        target_url = task.target_url
+        request_headers = task.request_headers
+        request_body = task.request_body
+        max_attempts = min(task.max_attempts, max_retries + 1)
+    else:
+        channel = registry.get(task.channel)
+        request_method = channel.method
+        target_url, request_headers, request_body = render_channel(channel, task.variables)
+        max_attempts = min(channel.max_attempts, max_retries + 1)
+        task.request_timeout_seconds = channel.timeout_seconds
+        task.base_retry_seconds = channel.base_retry_seconds
+        task.max_retry_seconds = channel.max_retry_seconds
     now = utcnow()
     task.status = "PENDING"
-    task.request_method = channel.method
+    task.request_method = request_method
     task.target_url = target_url
     task.request_headers = request_headers
     task.request_body = request_body
-    task.max_attempts = channel.max_attempts
+    task.max_attempts = max_attempts
     task.current_attempt = 0
     task.next_retry_at = now
     task.locked_until = None
@@ -195,10 +215,51 @@ def claim_tasks(
             NotificationTask.status.in_(DISPATCHABLE_STATUSES),
             NotificationTask.next_retry_at <= now,
         ),
-        and_(NotificationTask.status == "PROCESSING", NotificationTask.locked_until < now),
+        and_(
+            NotificationTask.status == "PROCESSING",
+            NotificationTask.locked_until < now,
+            NotificationTask.current_attempt < NotificationTask.max_attempts,
+        ),
     )
     claimed: list[NotificationTask] = []
     with session_factory() as session:
+        session.execute(
+            update(NotificationTask)
+            .where(
+                NotificationTask.status == "PROCESSING",
+                NotificationTask.locked_until < now,
+                NotificationTask.current_attempt >= NotificationTask.max_attempts,
+            )
+            .values(
+                status="DEAD",
+                locked_until=None,
+                lock_token=None,
+                last_error="处理租约过期且已达到最大尝试次数",
+                updated_at=now,
+            )
+        )
+        session.commit()
+
+        if session.bind is not None and session.bind.dialect.name == "mysql":
+            tasks = session.scalars(
+                select(NotificationTask)
+                .where(eligible)
+                .order_by(NotificationTask.next_retry_at, NotificationTask.created_at)
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            ).all()
+            for task in tasks:
+                task.status = "PROCESSING"
+                task.locked_until = lease_until
+                task.lock_token = str(uuid.uuid4())
+                task.current_attempt += 1
+                task.total_attempts += 1
+                task.updated_at = now
+            session.commit()
+            return tasks
+
+        # SQLite 仅用于本地测试。逐条条件更新使多个领取者即使读取到相同
+        # 候选任务，也只有一个能将其原子地转换为 PROCESSING。
         candidate_ids = session.scalars(
             select(NotificationTask.id)
             .where(eligible)

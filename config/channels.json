@@ -14,7 +14,7 @@
         "data": "{{ data }}"
       },
       "timeout_seconds": 5,
-      "max_attempts": 8,
+      "max_retries": 10,
       "max_concurrency": 5,
       "base_retry_seconds": 10,
       "max_retry_seconds": 86400

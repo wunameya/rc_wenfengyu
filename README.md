@@ -1,8 +1,20 @@
 # Reliable HTTP Notification Service
 
-一个基于 Python + FastAPI + SQLAlchemy 的可靠 HTTP 通知服务。业务系统只需提交渠道、幂等键和业务变量；服务先持久化任务并返回 `202 Accepted`，独立 Worker 再异步投递、失败重试或转入死信。
+## AI 使用说明
 
-React 控制台默认展示等待重试和已停止的任务，可查看目标地址、脱敏 Header、Body、错误、响应摘要和每次投递耗时，也可人工重新入队。
+本项目本次 Coding 全部由 AI 完成，包括方案设计、后端与前端编码、自动化测试、页面截图和文档整理。整体协作过程如下：
+
+1. AI 根据“可靠地将业务通知投递到不同外部 HTTP API”的需求给出了多套设计方案。
+2. 我选择了依赖较少、适合快速落地的“数据库任务表 + Worker”方案实现 MVP。
+3. 我的第一个关键决策是增加一个 React 管理页面，用于集中展示投递失败的请求、失败原因、请求内容和投递历史，并支持人工重试。
+4. 随后我继续询问 AI 消费者是如何定义和运行的，发现初版默认只启动一个 Worker 进程，虽然进程内部支持异步并发，但面对持续高流量仍可能产生任务堆积。
+5. 我的第二个关键决策是让 AI 将消费者改造成可人工配置的多 Worker 进程模型。为了让多个 Worker 能安全地并发抢占任务，我同时决定将生产默认数据库从 SQLite 切换为 MySQL，并使用行锁与 `FOR UPDATE SKIP LOCKED` 解决并发领取问题。
+
+因此，AI 负责具体方案展开和代码实现，我负责 MVP 范围选择、失败可视化、多消费者扩展以及数据库技术路线等关键决策。
+
+一个基于 Python + FastAPI + SQLAlchemy + MySQL 的可靠 HTTP 通知服务。业务系统只需提交渠道、幂等键和业务变量；服务先持久化任务并返回 `202 Accepted`，独立 Worker 再异步投递、失败重试或转入死信。
+
+React 控制台默认展示等待重试和已停止的任务，可查看目标地址、Body、错误、响应摘要和每次投递耗时，也可人工重新入队。页面另提供通知测试和运行设置入口。
 
 ## 对问题的理解
 
@@ -25,7 +37,7 @@ FastAPI 接入服务 ── 校验渠道、渲染模板、幂等落库 ──►
                                                             │
                                       到期任务抢占 + 处理租约 │
                                                             ▼
-                                                    Python Worker
+                                                   Python Workers × N
                                                             │
                                      超时 / 渠道并发限制 / 密钥注入
                                                             ▼
@@ -55,7 +67,7 @@ PENDING ──抢占──► PROCESSING ──2xx──► SUCCEEDED
 - `notification_tasks` 保存任务当前状态、业务变量、最终请求快照、重试计数、处理租约和最近错误。
 - `delivery_attempts` 追加记录每次调用的开始/结束时间、耗时、HTTP 状态、结果和响应摘要，供排障与审计。
 
-Worker 通过带条件的数据库更新抢占任务，并写入唯一租约令牌。进程异常退出后，租约到期的 `PROCESSING` 任务可被其他 Worker 再次抢占；旧 Worker 即使稍后返回，也不能覆盖新 Worker 的结果。
+多个 Worker 进程共享 MySQL。领取任务时使用 `SELECT ... FOR UPDATE SKIP LOCKED` 锁定并跳过其他进程正在领取的记录，在同一个事务内把任务改成 `PROCESSING` 并写入唯一租约令牌。进程异常退出后，租约到期的任务可被其他 Worker 再次抢占；旧 Worker 即使稍后返回，也不能覆盖新 Worker 的结果。
 
 ## 系统边界
 
@@ -67,6 +79,7 @@ Worker 通过带条件的数据库更新抢占任务，并写入唯一租约令�
 - 防止同一渠道下相同幂等键被重复创建。
 - 对网络异常、`408`、`429`、`5xx` 自动执行带抖动的指数退避。
 - Worker 崩溃后通过处理租约恢复未完成任务。
+- 支持通过配置或启动参数调整 Worker 进程数，每个进程内部使用异步 HTTP 并发。
 - 按渠道限制并发，降低故障供应商拖垮整个 Worker 的风险。
 - 展示失败任务、脱敏请求、响应摘要和投递历史，并允许人工重试。
 
@@ -99,9 +112,25 @@ Worker 通过带条件的数据库更新抢占任务，并写入唯一租约令�
 
 1. **短暂故障：** 网络错误、超时、`408`、`429` 和 `5xx` 按渠道配置自动重试。默认指数退避并加入随机抖动，`429` 的 `Retry-After` 优先于本地退避时间。
 2. **明确不可恢复：** `400`、`401`、`403`、`404` 等默认直接进入 `DEAD`，避免错误参数或过期凭证造成无意义的请求风暴。
-3. **长期不可用：** 达到 `max_attempts` 后停止自动请求并进入 `DEAD`。管理台保留完整上下文，运维修复供应商或渠道配置、重启 API 与 Worker 使新配置生效后，可以人工重试；`total_attempts` 不清零，便于审计，新的人工重试轮次从 `current_attempt = 0` 开始。
+3. **长期不可用：** 首次投递后最多自动重试 10 次，全部失败后进入 `DEAD`。管理台保留完整上下文，运维修复供应商或渠道配置、重启 API 与 Worker 使新配置生效后，可以人工重试；`total_attempts` 不清零，便于审计，新的人工重试轮次从 `current_attempt = 0` 开始。设置页可将新任务的全局重试上限调整为 0～10 次。
 
 第一版还通过全局并发和渠道级并发限制影响范围。生产环境应对死信数、待重试积压、最老任务年龄和渠道成功率配置告警；告警系统本身不在此仓库内实现。
+
+### 多 Worker 抢占机制
+
+`APP_WORKER_PROCESSES` 决定 Worker 进程数，`APP_WORKER_CONCURRENCY` 决定每个进程内部允许同时进行的异步 HTTP 请求数。例如 4 个进程、每进程并发 10，理论总并发上限为 40。它们不是 40 个线程，而是 4 个独立进程，每个进程运行一个 `asyncio` 事件循环。
+
+所有 Worker 共享 MySQL。每轮领取任务时执行按 `next_retry_at` 排序的 `SELECT ... FOR UPDATE SKIP LOCKED`：
+
+1. MySQL 对当前 Worker 选中的任务行加排他锁。
+2. 其他 Worker 执行相同查询时跳过这些已锁记录，领取后续任务。
+3. 当前 Worker 在同一事务中把记录改为 `PROCESSING`，设置 `locked_until` 和唯一 `lock_token` 后提交。
+4. HTTP 调用完成时，只有持有相同 `lock_token` 的 Worker 才能写入最终结果。
+5. Worker 崩溃后，租约到期的任务可再次被领取；达到最大尝试次数的过期任务会直接进入 `DEAD`，避免无限恢复。
+
+因此正常竞争不会让两个 Worker 同时领取同一行。不过至少一次语义仍允许极端情况下重复调用，例如供应商已经成功处理、Worker 却在写入成功状态前退出。下游仍需按 `event_id` 幂等。
+
+`max_concurrency` 是单进程、单渠道限制。多个 Worker 的渠道理论总并发为 `进程数 × max_concurrency`，配置时需要结合供应商限额。第一版没有引入 Redis 全局令牌桶。
 
 ## 关键工程决策与取舍
 
@@ -109,15 +138,15 @@ Worker 通过带条件的数据库更新抢占任务，并写入唯一租约令�
 |---|---|---|
 | 任务队列 | 数据库任务表 | 组件少、部署快，首版任务规模下可接受 |
 | HTTP 框架 | FastAPI | 类型校验和 OpenAPI 开箱即用，异步 HTTP 客户端生态成熟 |
-| 数据访问 | SQLAlchemy | 同一套模型可在本地 SQLite 与生产 MySQL 间切换 |
-| API 与投递 | 独立进程 | 外部系统延迟不阻塞接入；Worker 可独立扩容和重启 |
+| 数据访问 | SQLAlchemy + MySQL | MySQL 支持多 Worker 使用行锁和 `SKIP LOCKED` 并发领取；SQLite 仅用于测试 |
+| API 与投递 | 独立进程 | 外部系统延迟不阻塞接入；Worker 进程数可人工配置 |
 | 请求配置 | 受控模板 + 环境变量密钥 | 兼顾供应商差异、SSRF 防护和密钥不落库 |
 | 重试 | 指数退避 + 抖动 + Retry-After | 减少故障期间对供应商和自身的持续冲击 |
-| 任务抢占 | 条件更新 + 唯一租约令牌 | SQLite/MySQL 均可运行，并能处理 Worker 崩溃和迟到结果 |
+| 任务抢占 | MySQL `FOR UPDATE SKIP LOCKED` + 唯一租约令牌 | 多进程领取互斥，同时处理 Worker 崩溃和迟到结果 |
 | 历史记录 | 每次尝试单独追加 | 当前状态适合列表查询，尝试明细适合排障审计 |
 | 前端 | React + Vite | 页面交互简单、构建轻量，生产构建可由 FastAPI 直接托管 |
 
-Header 中的 `Authorization`、`Cookie`、`Proxy-Authorization`、`X-Api-Key` 会在任务快照中脱敏；实际 Secret 仅由 Worker 从环境变量读取。响应内容只保存有限长度摘要，降低敏感数据扩散和存储膨胀风险。
+Header 中的 `Authorization`、`Cookie`、`Proxy-Authorization`、`X-Api-Key` 会在任务快照中脱敏，并且 Header 不在前端页面展示；实际 Secret 仅由 Worker 从环境变量读取。响应内容只保存有限长度摘要，降低敏感数据扩散和存储膨胀风险。
 
 ## 首版没有采纳的过度设计
 
@@ -163,9 +192,17 @@ Header 中的 `Authorization`、`Cookie`、`Proxy-Authorization`、`X-Api-Key` �
 
 ![失败投递列表](docs/screenshots/failed-deliveries.png)
 
-点击列表行可查看完整详情并执行人工重试。Header 中的敏感值在持久化前已经脱敏。
+点击列表行可查看完整详情并执行人工重试。前端不展示请求或响应 Header。
 
 ![投递详情](docs/screenshots/delivery-detail.png)
+
+通知测试页允许输入目标 URL、请求方法、Body、超时时间和最大重试次数。提交后会先进入任务队列，再由 Worker 消费；页面轮询并展示状态、HTTP 状态、耗时、响应 Body 或网络错误。
+
+![通知测试](docs/screenshots/notification-test.png)
+
+运行设置页可以动态调整 1～10 个 Worker 进程以及 0～10 次全局重试上限，常驻管理进程会自动完成扩缩容。
+
+![运行设置](docs/screenshots/worker-settings.png)
 
 ## 目录
 
@@ -187,7 +224,25 @@ pip install -r requirements-dev.txt
 cd frontend && npm install && npm run build && cd ..
 ```
 
-启动 API 和 Worker（两个终端）：
+项目默认连接 MySQL：
+
+```text
+mysql+pymysql://notification:notification@127.0.0.1:3306/notification?charset=utf8mb4
+```
+
+如果本机有 Docker，可以直接启动开发数据库：
+
+```bash
+docker compose up -d mysql
+```
+
+也可以复制 `.env.example` 并修改为已有的 MySQL 实例：
+
+```bash
+cp .env.example .env
+```
+
+启动 API 和 Worker（两个终端）。Worker 默认启动 2 个进程：
 
 ```bash
 source .venv/bin/activate
@@ -199,7 +254,45 @@ source .venv/bin/activate
 python -m app.worker
 ```
 
+可以通过环境变量持久配置进程数：
+
+```bash
+APP_WORKER_PROCESSES=4 python -m app.worker
+```
+
+也可以在单次启动时人工覆盖：
+
+```bash
+python -m app.worker --workers 6
+make dev-worker WORKERS=6
+```
+
+`--once` 只用于测试和诊断：每个进程领取一批后就退出。由于 `SKIP LOCKED` 会跳过其他进程当时锁定的记录，单次模式可能需要再次执行才能扫完全部任务；常驻模式会立即进入下一轮并自动处理剩余任务。
+
+主要 Worker 配置：
+
+| 配置 | 默认值 | 说明 |
+|---|---:|---|
+| `APP_WORKER_PROCESSES` | 2 | Worker 进程数，可按积压情况人工调整 |
+| `APP_WORKER_CONCURRENCY` | 10 | 每个进程的异步 HTTP 全局并发上限 |
+| `APP_WORKER_BATCH_SIZE` | 20 | 每个进程单轮从 MySQL 领取的任务数 |
+| `APP_WORKER_POLL_INTERVAL_SECONDS` | 1 | 无可执行任务时的轮询间隔 |
+| `APP_WORKER_LEASE_SECONDS` | 60 | `PROCESSING` 任务的领取租约 |
+| `APP_WORKER_CONFIG_POLL_INTERVAL_SECONDS` | 2 | Worker 管理进程读取动态进程数配置的间隔 |
+| `APP_MAX_DELIVERY_RETRIES` | 10 | 新任务的默认全局最大重试次数，可在设置页调整 |
+| 渠道 `max_concurrency` | 5 | 每个 Worker 进程内该渠道的并发上限 |
+
 打开 <http://127.0.0.1:8000> 查看管理台；Swagger 文档位于 <http://127.0.0.1:8000/docs>。开发前端时可以运行 `cd frontend && npm run dev`，页面位于 5173 端口并代理后端请求。
+
+管理台顶部包含“失败投递”“通知测试”“设置”三个入口。“设置”页面可以在 1～10 之间修改 Worker 进程数，常驻 Worker 管理进程会周期性读取 MySQL 配置并自动扩缩容。
+
+出于 SSRF 防护考虑，测试页不能向任意主机发请求，默认只允许 `localhost`、`127.0.0.1` 和 `::1`；可以通过环境变量设置明确的测试目标白名单：
+
+```bash
+APP_TEST_ALLOWED_HOSTS=localhost,127.0.0.1,api.sandbox.example.com
+```
+
+测试请求会以 `manual-test` 渠道写入同一任务表，由 Worker 正常抢占和消费，默认最多重试 10 次（首次投递之外），并且禁止自动跟随重定向。为避免凭证落库，测试页面不提供 Header 输入，测试接口也拒绝 `Authorization`、`Cookie`、`X-Api-Key` 等敏感 Header；需要鉴权时应使用正式渠道配置。
 
 ## 提交通知
 
@@ -241,13 +334,15 @@ URL、普通 Header 和 Body 支持 `{{ variable }}` 模板。密钥不要写入
 
 ## MySQL
 
-本地默认使用 SQLite。部署时可直接更换连接字符串：
+系统默认使用 MySQL 8.0+，多 Worker 依赖 `FOR UPDATE SKIP LOCKED` 安全地并发领取任务。通过连接字符串指定实例：
 
 ```bash
 export APP_DATABASE_URL='mysql+pymysql://user:password@127.0.0.1:3306/notification?charset=utf8mb4'
 ```
 
 第一版使用 SQLAlchemy `create_all` 初始化表。生产环境建议接入 Alembic 管理后续表结构变更，并将 API 与 Worker 作为独立进程部署。
+
+SQLite 仅用于单元测试或单 Worker 临时调试；启动两个以上 Worker 时程序会拒绝 SQLite 配置，避免把 SQLite 当成生产并发队列使用。
 
 ## 测试
 
@@ -267,6 +362,7 @@ pytest -q
 - `503` 首次失败进入 `RETRY_WAIT`，到期后重试并转为 `SUCCEEDED`。
 - `400` 不自动重试并进入 `DEAD`，随后可人工重新入队。
 - 24 小时投递统计和成功率计算。
+- Worker 进程数环境配置与 SQLite 多进程保护。
 
 前端生产构建和依赖安全检查：
 
@@ -292,12 +388,15 @@ npm audit --audit-level=moderate
 
 | 检查项 | 结果 |
 |---|---|
-| Python 自动化测试 | `7 passed in 0.24s` |
+| Python 自动化测试 | `16 passed in 0.46s` |
 | Python 语法编译检查 | 通过 |
-| React 生产构建 | 通过，26 modules transformed |
+| React 生产构建 | 通过，1576 modules transformed |
 | 前端依赖审计 | `found 0 vulnerabilities` |
 | API 健康检查与静态页面托管 | HTTP 200 |
 | 失败投递链路 | 目标不可达后进入 `RETRY_WAIT`，记录连接错误 |
 | 人工恢复链路 | 重新入队后投递成功，状态转为 `SUCCEEDED`，两次尝试均保留 |
-| 页面检查 | 失败列表与详情抽屉均已通过本地浏览器渲染并生成上述截图 |
+| 多 Worker 配置 | 环境变量与设置页读写通过；SQLite 多进程保护通过 |
+| MySQL 多 Worker 并发领取 | MySQL 8.4 下 2 个 Worker 处理 40 条任务；40 条成功、40 个唯一任务、单任务最多领取 1 次 |
+| 通知测试接口 | 入队消费、白名单拒绝、敏感 Header 拒绝和网络错误记录 4 个场景通过 |
+| 页面检查 | 失败列表、通知测试、运行设置与详情弹窗均已通过本地浏览器渲染并生成上述截图 |
 

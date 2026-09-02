@@ -47,3 +47,60 @@ def test_retry_requires_failed_state(app_context, sample_payload):
 
     assert response.status_code == 409
 
+
+def test_settings_allow_manual_worker_process_count(monkeypatch):
+    from app.settings import Settings
+
+    monkeypatch.setenv("APP_WORKER_PROCESSES", "4")
+
+    assert Settings.from_env().worker_processes == 4
+
+
+def test_worker_settings_can_be_changed_from_api(app_context):
+    _, client, _ = app_context
+
+    initial = client.get("/api/v1/settings/workers")
+    assert initial.status_code == 200
+    assert initial.json()["worker_processes"] == 2
+    assert initial.json()["per_process_concurrency"] == 5
+    assert initial.json()["theoretical_max_concurrency"] == 10
+    assert initial.json()["max_delivery_retries"] == 10
+
+    updated = client.put(
+        "/api/v1/settings/workers",
+        json={"worker_processes": 4, "max_delivery_retries": 7},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["worker_processes"] == 4
+    assert updated.json()["theoretical_max_concurrency"] == 20
+    assert updated.json()["max_delivery_retries"] == 7
+    assert client.get("/api/v1/settings/workers").json()["worker_processes"] == 4
+
+
+def test_worker_settings_reject_process_count_above_limit(app_context):
+    _, client, _ = app_context
+
+    response = client.put(
+        "/api/v1/settings/workers", json={"worker_processes": 11}
+    )
+
+    assert response.status_code == 422
+
+    retry_response = client.put(
+        "/api/v1/settings/workers", json={"max_delivery_retries": 11}
+    )
+    assert retry_response.status_code == 422
+
+
+def test_global_retry_limit_applies_to_new_tasks(app_context, sample_payload):
+    _, client, _ = app_context
+    updated = client.put(
+        "/api/v1/settings/workers", json={"max_delivery_retries": 1}
+    )
+    assert updated.status_code == 200
+
+    accepted = client.post("/api/v1/notifications", json=sample_payload).json()
+    task = client.get(f"/api/v1/tasks/{accepted['id']}").json()
+
+    assert task["max_attempts"] == 2
+

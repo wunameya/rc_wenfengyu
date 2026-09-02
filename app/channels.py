@@ -69,6 +69,15 @@ class ChannelRegistry:
                 header: SecretHeader(env=value["env"], prefix=value.get("prefix", ""))
                 for header, value in raw.get("secret_headers", {}).items()
             }
+            if "max_retries" in raw:
+                max_retries = int(raw["max_retries"])
+                if not 0 <= max_retries <= 10:
+                    raise ChannelError(f"渠道 {name} 的 max_retries 必须在 0 到 10 之间")
+                max_attempts = max_retries + 1
+            else:
+                max_attempts = int(raw.get("max_attempts", 11))
+                if not 1 <= max_attempts <= 11:
+                    raise ChannelError(f"渠道 {name} 的 max_attempts 必须在 1 到 11 之间")
             channels[name] = Channel(
                 name=name,
                 method=raw.get("method", "POST").upper(),
@@ -77,7 +86,7 @@ class ChannelRegistry:
                 secret_headers=secret_headers,
                 body=raw.get("body", {}),
                 timeout_seconds=float(raw.get("timeout_seconds", 5)),
-                max_attempts=int(raw.get("max_attempts", 8)),
+                max_attempts=max_attempts,
                 max_concurrency=int(raw.get("max_concurrency", 5)),
                 base_retry_seconds=float(raw.get("base_retry_seconds", 10)),
                 max_retry_seconds=float(raw.get("max_retry_seconds", 86400)),
