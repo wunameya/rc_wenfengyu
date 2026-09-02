@@ -1,0 +1,23 @@
+{
+  "channels": {
+    "demo-webhook": {
+      "method": "POST",
+      "url": "http://127.0.0.1:9000/webhook/{{ event_type }}",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Notification-Source": "internal-notification-service"
+      },
+      "secret_headers": {},
+      "body": {
+        "event_id": "{{ event_id }}",
+        "event_type": "{{ event_type }}",
+        "data": "{{ data }}"
+      },
+      "timeout_seconds": 5,
+      "max_attempts": 8,
+      "max_concurrency": 5,
+      "base_retry_seconds": 10,
+      "max_retry_seconds": 86400
+    }
+  }
+}
